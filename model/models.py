@@ -5,13 +5,17 @@ import torch.nn.functional as F
 from .modules import TextEncoder, ProjectionHead, RegressionHead
 
 
+# [注意] EQCorrectionHead 类已移除，因为不再使用浅层修正
+
+
 class CLIPModel(nn.Module):
+    # ... (CLIPModel, cross_entropy, RegressionModel 保持不变) ...
     def __init__(
-        self,
-        config
-        # temperature=CFG.temperature,
-        # image_embedding=CFG.image_embedding,
-        # text_embedding=CFG.text_embedding,
+            self,
+            config
+            # temperature=CFG.temperature,
+            # image_embedding=CFG.image_embedding,
+            # text_embedding=CFG.text_embedding,
     ):
         super().__init__()
         # self.image_encoder = ImageEncoder()
@@ -27,7 +31,7 @@ class CLIPModel(nn.Module):
         text_features = self.text_encoder(batch)
         # Getting Image and Text Embeddings (with same dimension)
         # image_embeddings = self.image_projection(image_features)
-        
+
         text_embeddings = self.text_projection(text_features)
         graph_embeddings = batch['graph_embed']
 
@@ -40,7 +44,7 @@ class CLIPModel(nn.Module):
         )
         texts_loss = cross_entropy(logits, targets, reduction='none')
         images_loss = cross_entropy(logits.T, targets.T, reduction='none')
-        loss =  (images_loss + texts_loss) / 2.0 # shape: (batch_size)
+        loss = (images_loss + texts_loss) / 2.0  # shape: (batch_size)
         return loss.mean()
 
 
@@ -51,7 +55,8 @@ def cross_entropy(preds, targets, reduction='none'):
         return loss
     elif reduction == "mean":
         return loss.mean()
-    
+
+
 class RegressionModel(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -60,6 +65,7 @@ class RegressionModel(nn.Module):
         self.text_projection = ProjectionHead(config)
         self.regressor = RegressionHead(config)
         self._initialize_weights(self.regressor)
+
     def _initialize_weights(self, module):
         for m in module.modules():
             if isinstance(m, nn.Linear):
@@ -73,6 +79,7 @@ class RegressionModel(nn.Module):
         output = self.regressor(output)
         return output
 
+
 class RegressionModel2(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -83,7 +90,11 @@ class RegressionModel2(nn.Module):
         self.dense = nn.Linear(config['RobertaConfig']['hidden_size'],
                                config['RobertaConfig']['hidden_size'])
         self.activation = nn.Tanh()
-        self.regresshead = nn.Linear(config['RobertaConfig']['hidden_size'], 1) 
+
+        # =========== 输出维度 2 ===========
+        self.regresshead = nn.Linear(config['RobertaConfig']['hidden_size'], 2)
+        # =============================================
+
         # self._initialize_weights(self.regressor)
         self._initialize_weights(self.regresshead)
 
@@ -102,3 +113,47 @@ class RegressionModel2(nn.Module):
         # ==================================
         output = self.regresshead(output)
         return output
+
+
+# ==========================================
+# [最终版本] RegressionModelWithResidual: 深度融合 (Concatenation Fusion)
+# ==========================================
+class RegressionModelWithResidual(RegressionModel2):
+
+    def __init__(self, config, graph_dim):
+        # 初始化 TextEncoder, dense, activation
+        super().__init__(config)
+
+        # [修改 1] 重新定义回归头 (regresshead) 的输入维度
+        # 新维度 = 文本隐藏层维度 (768) + EQ 嵌入维度 (graph_dim)
+        new_input_dim = config['RobertaConfig']['hidden_size'] + graph_dim
+
+        # 重新定义 regresshead 以适应新的输入维度
+        self.regresshead = nn.Linear(new_input_dim, 2)
+        self._initialize_weights(self.regresshead)  # 重新初始化权重
+
+        print(f"Regression Head Input Dim changed to: {new_input_dim} (Deep Fusion)")
+
+    def forward(self, batch):
+        # 1. 文本编码器 + Pooler
+        text_features = self.text_encoder(batch)
+        pooled_output = self.dense(text_features)  # [Batch, Hidden_Dim]
+        pooled_output = self.activation(pooled_output)
+
+        pred_targets = pooled_output
+
+        # 2. [关键修改] 深度融合：拼接 Text 特征和 EQ 特征
+        if 'graph_embs' in batch and batch['graph_embs'] is not None and batch['graph_embs'].dim() == 2:
+            eq_emb = batch['graph_embs']  # [Batch, Graph_Dim]
+
+            # 拼接特征 [Batch, Hidden_Dim + Graph_Dim]
+            fusion_output = torch.cat([pooled_output, eq_emb], dim=1)
+
+            # 使用新的回归头进行预测 (直接输出最终预测)
+            pred_targets = self.regresshead(fusion_output)
+
+            # 返回 pred_targets 和 eq_emb (保持签名兼容)
+            return pred_targets, eq_emb
+
+            # 如果没有 EQ 嵌入，必须报错，因为模型维度已改变
+        raise ValueError("Deep Fusion Model requires 'graph_embs' but none was provided or loaded.")
